@@ -6,101 +6,92 @@ package akka.routing
 
 import scala.collection.immutable
 import scala.reflect.ClassTag
-import java.util.Arrays
 
 /**
- * Consistent Hashing node ring implementation.
+ * Rendevouz Hashing implementation.
  *
- * A good explanation of Consistent Hashing:
- * http://weblogs.java.net/blog/tomwhite/archive/2007/11/consistent_hash.html
- *
- * Note that toString of the ring nodes are used for the node
- * hash, i.e. make sure it is different for different nodes.
+ * A good explanation of Rendevouz Hashing:
+ * https://en.wikipedia.org/wiki/Rendezvous_hashing
  *
  */
-class RendevouzHash[T: ClassTag] private(nodes: immutable.SortedMap[Int, T], val virtualNodesFactor: Int) {
+class RendevouzHash[T: ClassTag] private(nodes: immutable.Map[Int, T]) {
 
   import RendevouzHash._
 
-  if (virtualNodesFactor < 1) throw new IllegalArgumentException("virtualNodesFactor must be >= 1")
-
-  // arrays for fast binary search and access
-  // nodeHashRing is the sorted hash values of the nodes
-  // nodeRing is the nodes sorted in the same order as nodeHashRing, i.e. same index
-  private val (nodeHashRing: Array[Int], nodeRing: Array[T]) = {
-    val (nhr: Seq[Int], nr: Seq[T]) = nodes.toSeq.unzip
-    (nhr.toArray, nr.toArray)
-  }
-
   /**
-   * Adds a node to the node ring.
+   * Adds a node to the node list.
    * Note that the instance is immutable and this
    * operation returns a new instance.
    */
-  def :+(node: T): RendevouzHash[T] = {
-    val nodeHash = hashFor(node.toString)
-    new RendevouzHash(
-      nodes ++ ((1 to virtualNodesFactor) map { r ⇒ (concatenateNodeHash(nodeHash, r) → node) }),
-      virtualNodesFactor)
-  }
+  def :+(node: T): RendevouzHash[T] = new RendevouzHash(nodes ++ immutable.Map( node.hashCode() -> node ))
 
   /**
-   * Java API: Adds a node to the node ring.
+   * Java API: Adds a node to node list.
    * Note that the instance is immutable and this
    * operation returns a new instance.
    */
   def add(node: T): RendevouzHash[T] = this :+ node
 
   /**
-   * Removes a node from the node ring.
+   * Removes a node from the node list.
    * Note that the instance is immutable and this
    * operation returns a new instance.
    */
-  def :-(node: T): RendevouzHash[T] = {
-    val nodeHash = hashFor(node.toString)
-    new RendevouzHash(
-      nodes -- ((1 to virtualNodesFactor) map { r ⇒ concatenateNodeHash(nodeHash, r) }),
-      virtualNodesFactor)
-  }
+  def :-(node: T): RendevouzHash[T] = new RendevouzHash(nodes - node.hashCode())
 
   /**
-   * Java API: Removes a node from the node ring.
+   * Java API: Removes a node from the node list.
    * Note that the instance is immutable and this
    * operation returns a new instance.
    */
   def remove(node: T): RendevouzHash[T] = this :- node
 
-  // converts the result of Arrays.binarySearch into a index in the nodeRing array
-  // see documentation of Arrays.binarySearch for what it returns
-  private def idx(i: Int): Int = {
-    if (i >= 0) i // exact match
-    else {
-      val j = math.abs(i + 1)
-      if (j >= nodeHashRing.length) 0 // after last, use first
-      else j // next node clockwise
-    }
-  }
-
   /**
    * Get the node responsible for the data key.
-   * Can only be used if nodes exists in the node ring,
+   * Can only be used if nodes exists in the node list,
    * otherwise throws `IllegalStateException`
    */
   def nodeFor(key: Array[Byte]): T = {
-    if (isEmpty) throw new IllegalStateException("Can't get node for [%s] from an empty node ring" format key)
+    if (isEmpty) throw new IllegalStateException("Can't get node for [%s] from an empty node list" format key)
 
-    nodeRing(idx(Arrays.binarySearch(nodeHashRing, hashFor(key))))
+    var highScore = -1
+    var winner = 0
+
+    for ( node <- nodes ) {
+      val score = hashFor(Array[Byte](node.hashCode().toByte) ++ key)
+      if (score > highScore) {
+        highScore = score
+        winner = node.hashCode()
+      }
+      else if (score == highScore) {
+        winner = math.max(node.hashCode(), winner)
+      }
+    }
+    nodes(winner)
   }
 
   /**
    * Get the node responsible for the data key.
-   * Can only be used if nodes exists in the node ring,
+   * Can only be used if nodes exists in the node list,
    * otherwise throws `IllegalStateException`
    */
   def nodeFor(key: String): T = {
-    if (isEmpty) throw new IllegalStateException("Can't get node for [%s] from an empty node ring" format key)
+    if (isEmpty) throw new IllegalStateException("Can't get node for [%s] from an empty node list" format key)
 
-    nodeRing(idx(Arrays.binarySearch(nodeHashRing, hashFor(key))))
+    var highScore = -1
+    var winner = 0
+
+    for ( node <- nodes ) {
+      val score = hashFor(node.hashCode().toString ++ key)
+      if (score > highScore) {
+        highScore = score
+        winner = node.hashCode()
+      }
+      else if (score == highScore) {
+        winner = math.max(node.hashCode(), winner)
+      }
+    }
+    nodes(winner)
   }
 
   /**
@@ -111,30 +102,21 @@ class RendevouzHash[T: ClassTag] private(nodes: immutable.SortedMap[Int, T], val
 }
 
 object RendevouzHash {
-  def apply[T: ClassTag](nodes: Iterable[T], virtualNodesFactor: Int): RendevouzHash[T] = {
+
+  def apply[T: ClassTag](nodes: Iterable[T]): RendevouzHash[T] = {
     new RendevouzHash(
-      immutable.SortedMap.empty[Int, T] ++
+      immutable.Map.empty[Int, T] ++
         (for {
           node ← nodes
-          nodeHash = hashFor(node.toString)
-          vnode ← 1 to virtualNodesFactor
-        } yield (concatenateNodeHash(nodeHash, vnode) → node)),
-      virtualNodesFactor)
+        } yield (node.hashCode(), node)))
   }
 
   /**
    * Java API: Factory method to create a ConsistentHash
    */
-  def create[T](nodes: java.lang.Iterable[T], virtualNodesFactor: Int): RendevouzHash[T] = {
+  def create[T](nodes: java.lang.Iterable[T]): RendevouzHash[T] = {
     import scala.collection.JavaConverters._
-    apply(nodes.asScala, virtualNodesFactor)(ClassTag(classOf[Any].asInstanceOf[Class[T]]))
-  }
-
-  private def concatenateNodeHash(nodeHash: Int, vnode: Int): Int = {
-    import MurmurHash._
-    var h = startHash(nodeHash)
-    h = extendHash(h, vnode, startMagicA, startMagicB)
-    finalizeHash(h)
+    apply(nodes.asScala)(ClassTag(classOf[Any].asInstanceOf[Class[T]]))
   }
 
   private def hashFor(bytes: Array[Byte]): Int = MurmurHash.arrayHash(bytes)
